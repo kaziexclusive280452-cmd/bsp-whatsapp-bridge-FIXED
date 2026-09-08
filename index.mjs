@@ -14,6 +14,7 @@ const {
   default: makeWASocket,
   Browsers,
   DisconnectReason,
+  fetchLatestBaileysVersion,
   initAuthCreds,
   makeCacheableSignalKeyStore,
   proto,
@@ -109,8 +110,13 @@ async function startSession(userId, storedCreds) {
 
   const { state, persist } = makeRemoteAuthState(userId, storedCreds);
 
+  // WhatsApp rejects stale web-client versions with an immediate socket close
+  // and never emits a QR. Resolve the current supported version at session
+  // start instead of relying on the version bundled with Baileys.
+  const { version } = await fetchLatestBaileysVersion();
   const sock = makeWASocket({
     auth: state,
+    version,
     logger,
     printQRInTerminal: false,
     browser: Browsers.appropriate('BillStock Pro'),
@@ -153,7 +159,7 @@ async function startSession(userId, storedCreds) {
         user_id: userId,
         status: 'disconnected',
         clear_creds: loggedOut,
-        error: loggedOut ? 'Device unlinked from WhatsApp' : null,
+        error: loggedOut ? 'Device unlinked from WhatsApp' : `WhatsApp socket closed (${code || 'unknown'}); retrying`,
       });
       console.log(`[bridge] ${userId} closed (code ${code || 'n/a'})`);
     }

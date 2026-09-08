@@ -1,0 +1,16 @@
+{
+  "name": "billstock-whatsapp-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "index.mjs",
+  "scripts": {
+    "start": "node index.mjs"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "6.7.9",
+    "dotenv": "16.4.5",
+    "pino": "9.4.0",
+    "qrcode": "1.5.4"
+  }
+}

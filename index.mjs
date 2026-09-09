@@ -6,12 +6,7 @@
  * Message text is never stored or forwarded.
  */
 import 'dotenv/config';
-import baileys from '@whiskeysockets/baileys';
-import QRCode from 'qrcode';
-import pino from 'pino';
-
-const {
-  default: makeWASocket,
+import makeWASocket, {
   Browsers,
   DisconnectReason,
   fetchLatestBaileysVersion,
@@ -19,7 +14,9 @@ const {
   makeCacheableSignalKeyStore,
   proto,
   BufferJSON,
-} = baileys;
+} from '@whiskeysockets/baileys';
+import QRCode from 'qrcode';
+import pino from 'pino';
 
 const BRIDGE_URL = process.env.BRIDGE_URL;
 const BRIDGE_TOKEN = process.env.BRIDGE_TOKEN;

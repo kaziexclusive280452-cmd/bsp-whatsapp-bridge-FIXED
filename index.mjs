@@ -103,25 +103,54 @@ function extractReferral(msg) {
 
 /**
  * Newer WhatsApp Business accounts often address inbound chats with a private
- * LID JID and expose the real phone JID in remoteJidAlt/participantAlt. Older
- * accounts use @s.whatsapp.net directly. Prefer the phone JID, but retain a
- * numeric LID as a stable fallback so the chat is never silently discarded.
+ * LID JID and expose the real phone JID in senderPn/remoteJidAlt/participantAlt.
+ * Older accounts use @s.whatsapp.net directly. Keep a stable chat key (the LID
+ * when that is all we get) but always try hard to resolve the real phone, since
+ * order matching and Meta CAPI depend on it.
  */
 function extractSender(msg) {
   const key = msg?.key || {};
   const candidates = [
+    key.senderPn,
     key.remoteJidAlt,
     key.participantAlt,
+    msg?.senderPn,
     key.remoteJid,
     key.participant,
   ].filter(Boolean);
+  const digits = (jid) => String(jid).split('@')[0].split(':')[0].replace(/\D/g, '');
   const phoneJid = candidates.find((jid) => String(jid).endsWith('@s.whatsapp.net'));
-  const selected = phoneJid || candidates.find((jid) => String(jid).endsWith('@lid'));
+  const lidJid = candidates.find((jid) => String(jid).endsWith('@lid'));
+  const selected = phoneJid || lidJid;
   if (!selected) return null;
-  const waId = String(selected).split('@')[0].split(':')[0].replace(/\D/g, '');
+  const waId = digits(selected);
   if (!waId) return null;
-  return { waId, isLid: String(selected).endsWith('@lid') };
+  return {
+    waId,
+    isLid: !phoneJid,
+    phone: phoneJid ? digits(phoneJid) : null,
+    lid: lidJid || null,
+  };
 }
+
+/** Ask Baileys' LID mapping store for the phone number behind a @lid JID. */
+async function resolvePhoneFromLid(sock, lidJid) {
+  if (!lidJid) return null;
+  const mapping = sock?.signalRepository?.lidMapping;
+  const tryFns = [
+    () => mapping?.getPNForLID?.(lidJid),
+    () => mapping?.getPNForLid?.(lidJid),
+  ];
+  for (const fn of tryFns) {
+    try {
+      const pn = await fn();
+      const digits = String(pn || '').split('@')[0].split(':')[0].replace(/\D/g, '');
+      if (digits.length >= 10) return digits;
+    } catch { /* try next */ }
+  }
+  return null;
+}
+
 
 async function startSession(userId, storedCreds) {
   if (sessions.has(userId)) return;
@@ -211,18 +240,21 @@ async function startSession(userId, storedCreds) {
           continue;
         }
         const { ctwa_clid, ad_id, source_type } = extractReferral(msg);
+        const phone = sender.phone || (await resolvePhoneFromLid(sock, sender.lid));
         const result = await api('inbound', {
           user_id: userId,
           wa_id: sender.waId,
           is_lid: sender.isLid,
+          phone,
           name: msg.pushName || null,
           ctwa_clid,
           ad_id,
           source_type,
         });
         if (result.success) {
-          console.log(`[bridge] inbound contact saved for ${userId}${sender.isLid ? ' (LID)' : ''}`);
+          console.log(`[bridge] inbound contact saved for ${userId} (phone: ${phone || 'unresolved'})`);
         }
+
       } catch (e) {
         console.warn('[bridge] inbound failed:', e.message);
       }

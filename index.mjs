@@ -113,15 +113,27 @@ async function startSession(userId, storedCreds) {
   // WhatsApp rejects stale web-client versions with an immediate socket close
   // and never emits a QR. Resolve the current supported version at session
   // start instead of relying on the version bundled with Baileys.
-  const { version } = await fetchLatestBaileysVersion();
+  const { version, isLatest } = await fetchLatestBaileysVersion();
+  console.log(`[bridge] WhatsApp Web version ${version.join('.')} (latest: ${isLatest})`);
   const sock = makeWASocket({
     auth: state,
     version,
     logger,
     printQRInTerminal: false,
-    browser: Browsers.appropriate('BillStock Pro'),
+    // WhatsApp Business rejects custom/unknown client identities during
+    // link-device pairing (the scan appears to succeed, then the socket closes
+    // without ever reaching 'open'). A standard desktop browser identity is
+    // accepted by both WhatsApp and WhatsApp Business.
+    browser: Browsers.ubuntu('Chrome'),
     syncFullHistory: false,
     markOnlineOnConnect: false,
+    generateHighQualityLinkPreview: false,
+    // Business accounts sync a large app-state payload right after pairing;
+    // a short timeout closes the socket mid-handshake and pairing never lands.
+    defaultQueryTimeoutMs: 120_000,
+    keepAliveIntervalMs: 20_000,
+    connectTimeoutMs: 60_000,
+    retryRequestDelayMs: 1_000,
   });
 
   sessions.set(userId, { sock });
@@ -133,8 +145,10 @@ async function startSession(userId, storedCreds) {
 
     if (qr) {
       try {
+        console.log(`[bridge] QR received for ${userId}; uploading`);
         const dataUrl = await QRCode.toDataURL(qr, { margin: 1, width: 320 });
-        await api('set_qr', { user_id: userId, qr: dataUrl });
+        const result = await api('set_qr', { user_id: userId, qr: dataUrl });
+        if (result.success) console.log(`[bridge] QR uploaded for ${userId}`);
       } catch (e) {
         console.warn('[bridge] qr encode failed:', e.message);
       }
@@ -213,8 +227,9 @@ async function tick() {
       console.log(`[bridge] starting session for ${s.user_id} (${s.status})`);
       startSession(s.user_id, s.creds).catch((e) => {
         sessions.delete(s.user_id);
-        console.warn('[bridge] start failed:', e.message);
-        api('set_status', { user_id: s.user_id, status: 'disconnected', error: e.message });
+        const message = e instanceof Error ? e.message : String(e);
+        console.warn('[bridge] start failed:', message);
+        api('set_status', { user_id: s.user_id, status: 'disconnected', error: `Bridge start failed: ${message}` });
       });
     }
   }

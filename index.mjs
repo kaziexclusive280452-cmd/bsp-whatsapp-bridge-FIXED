@@ -133,23 +133,62 @@ function extractSender(msg) {
   };
 }
 
+/**
+ * LID -> phone cache filled from contact events. WhatsApp Business often only
+ * reveals the real number in a contacts.upsert/update payload, not on the
+ * message itself, so remember every pair we ever see.
+ */
+const lidPhoneCache = new Map();
+
+function rememberLidPhone(lid, phone) {
+  const l = String(lid || '').split('@')[0].replace(/\D/g, '');
+  const p = String(phone || '').split('@')[0].split(':')[0].replace(/\D/g, '');
+  if (l && p.length >= 10) lidPhoneCache.set(l, p);
+}
+
+function harvestContacts(contacts) {
+  for (const c of contacts || []) {
+    const id = String(c?.id || '');
+    const alt = String(c?.jid || c?.lid || c?.phoneNumber || c?.pn || '');
+    if (id.endsWith('@lid') && alt) rememberLidPhone(id, alt);
+    if (id.endsWith('@s.whatsapp.net') && alt.endsWith('@lid')) rememberLidPhone(alt, id);
+  }
+}
+
 /** Ask Baileys' LID mapping store for the phone number behind a @lid JID. */
 async function resolvePhoneFromLid(sock, lidJid) {
   if (!lidJid) return null;
+  const bare = String(lidJid).split('@')[0].replace(/\D/g, '');
+  if (lidPhoneCache.has(bare)) return lidPhoneCache.get(bare);
+
   const mapping = sock?.signalRepository?.lidMapping;
   const tryFns = [
     () => mapping?.getPNForLID?.(lidJid),
     () => mapping?.getPNForLid?.(lidJid),
+    () => mapping?.getPNForLID?.(bare),
+    async () => {
+      const keys = sock?.authState?.keys;
+      const got = await keys?.get?.('lid-mapping', [bare, lidJid]);
+      return got?.[bare] || got?.[lidJid] || null;
+    },
+    async () => {
+      const res = await sock?.onWhatsApp?.(lidJid);
+      return res?.[0]?.jid || null;
+    },
   ];
   for (const fn of tryFns) {
     try {
       const pn = await fn();
       const digits = String(pn || '').split('@')[0].split(':')[0].replace(/\D/g, '');
-      if (digits.length >= 10) return digits;
+      if (digits.length >= 10) {
+        rememberLidPhone(bare, digits);
+        return digits;
+      }
     } catch { /* try next */ }
   }
   return null;
 }
+
 
 
 async function startSession(userId, storedCreds) {
@@ -227,6 +266,29 @@ async function startSession(userId, storedCreds) {
     }
   });
 
+  // Contact events are the most reliable place WhatsApp Business reveals the
+  // real phone number behind a LID chat. Cache every pair, and immediately
+  // patch chats we had already stored without a phone.
+  const onContacts = async (contacts) => {
+    harvestContacts(contacts);
+    for (const c of contacts || []) {
+      const id = String(c?.id || '');
+      if (!id.endsWith('@lid')) continue;
+      const bare = id.split('@')[0].replace(/\D/g, '');
+      const phone = lidPhoneCache.get(bare);
+      if (!phone) continue;
+      try {
+        await api('inbound_phone', { user_id: userId, wa_id: bare, phone, name: c?.name || c?.notify || null });
+        console.log(`[bridge] resolved phone for LID ${bare}`);
+      } catch (e) {
+        console.warn('[bridge] phone patch failed:', e.message);
+      }
+    }
+  };
+  sock.ev.on('contacts.upsert', onContacts);
+  sock.ev.on('contacts.update', onContacts);
+
+
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify' && type !== 'append') return;
     for (const msg of messages) {
@@ -240,7 +302,9 @@ async function startSession(userId, storedCreds) {
           continue;
         }
         const { ctwa_clid, ad_id, source_type } = extractReferral(msg);
+        if (sender.phone && sender.lid) rememberLidPhone(sender.lid, sender.phone);
         const phone = sender.phone || (await resolvePhoneFromLid(sock, sender.lid));
+
         const result = await api('inbound', {
           user_id: userId,
           wa_id: sender.waId,

@@ -101,6 +101,28 @@ function extractReferral(msg) {
   };
 }
 
+/**
+ * Newer WhatsApp Business accounts often address inbound chats with a private
+ * LID JID and expose the real phone JID in remoteJidAlt/participantAlt. Older
+ * accounts use @s.whatsapp.net directly. Prefer the phone JID, but retain a
+ * numeric LID as a stable fallback so the chat is never silently discarded.
+ */
+function extractSender(msg) {
+  const key = msg?.key || {};
+  const candidates = [
+    key.remoteJidAlt,
+    key.participantAlt,
+    key.remoteJid,
+    key.participant,
+  ].filter(Boolean);
+  const phoneJid = candidates.find((jid) => String(jid).endsWith('@s.whatsapp.net'));
+  const selected = phoneJid || candidates.find((jid) => String(jid).endsWith('@lid'));
+  if (!selected) return null;
+  const waId = String(selected).split('@')[0].split(':')[0].replace(/\D/g, '');
+  if (!waId) return null;
+  return { waId, isLid: String(selected).endsWith('@lid') };
+}
+
 async function startSession(userId, storedCreds) {
   if (sessions.has(userId)) return;
   sessions.set(userId, { starting: true });
@@ -177,22 +199,30 @@ async function startSession(userId, storedCreds) {
   });
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
+    if (type !== 'notify' && type !== 'append') return;
     for (const msg of messages) {
       try {
         if (msg.key?.fromMe) continue;
-        const jid = msg.key?.remoteJid || '';
-        if (!jid.endsWith('@s.whatsapp.net')) continue; // skip groups / broadcasts
-        const waId = jid.split('@')[0];
+        const remoteJid = msg.key?.remoteJid || '';
+        if (remoteJid.endsWith('@g.us') || remoteJid === 'status@broadcast') continue;
+        const sender = extractSender(msg);
+        if (!sender) {
+          console.warn('[bridge] skipped inbound: no supported sender ID');
+          continue;
+        }
         const { ctwa_clid, ad_id, source_type } = extractReferral(msg);
-        await api('inbound', {
+        const result = await api('inbound', {
           user_id: userId,
-          wa_id: waId,
+          wa_id: sender.waId,
+          is_lid: sender.isLid,
           name: msg.pushName || null,
           ctwa_clid,
           ad_id,
           source_type,
         });
+        if (result.success) {
+          console.log(`[bridge] inbound contact saved for ${userId}${sender.isLid ? ' (LID)' : ''}`);
+        }
       } catch (e) {
         console.warn('[bridge] inbound failed:', e.message);
       }

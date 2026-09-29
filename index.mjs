@@ -2,13 +2,13 @@
  * BillStock Pro — WhatsApp link-device bridge
  *
  * Holds one WhatsApp Web companion session per shop, uploads the pairing QR,
- * and reports incoming contacts (phone, name, ad-click reference) to the app.
- * Message text is never stored or forwarded.
+ * reports incoming messages to the app, and delivers replies queued by Inbox.
  */
 import 'dotenv/config';
 import makeWASocket, {
   Browsers,
   DisconnectReason,
+  downloadMediaMessage,
   fetchLatestBaileysVersion,
   initAuthCreds,
   makeCacheableSignalKeyStore,
@@ -40,6 +40,26 @@ async function api(action, payload = {}) {
   });
   const out = await res.json().catch(() => ({}));
   if (!out.success) console.warn(`[bridge] ${action} failed:`, out.error || res.status);
+  return out;
+}
+
+async function uploadInboundMedia(userId, messageId, media) {
+  const buffer = await downloadMediaMessage(media.source, 'buffer', {}, { logger });
+  const res = await fetch(BRIDGE_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': media.mime || 'application/octet-stream',
+      'x-bridge-token': BRIDGE_TOKEN,
+      'x-bridge-action': 'upload_media',
+      'x-user-id': userId,
+      'x-message-id': messageId,
+      'x-media-type': media.type,
+      'x-file-name': encodeURIComponent(media.name || ''),
+    },
+    body: buffer,
+  });
+  const out = await res.json().catch(() => ({}));
+  if (!out.success) throw new Error(out.error || `Media upload failed (${res.status})`);
   return out;
 }
 
@@ -99,6 +119,19 @@ function extractReferral(msg) {
     ad_id: ad?.sourceId || null,
     source_type: ad?.sourceType || (ad ? 'ad' : null),
   };
+}
+
+function messageContent(msg) {
+  let content = msg?.message || {};
+  content = content.ephemeralMessage?.message || content.viewOnceMessageV2?.message || content.viewOnceMessage?.message || content;
+  const text = content.conversation || content.extendedTextMessage?.text ||
+    content.imageMessage?.caption || content.videoMessage?.caption || content.documentMessage?.caption || null;
+  if (content.imageMessage) return { text, type: 'image', source: msg, mime: content.imageMessage.mimetype || 'image/jpeg', name: null };
+  if (content.videoMessage) return { text, type: 'video', source: msg, mime: content.videoMessage.mimetype || 'video/mp4', name: null };
+  if (content.audioMessage) return { text, type: 'audio', source: msg, mime: content.audioMessage.mimetype || 'audio/ogg', name: null };
+  if (content.documentMessage) return { text, type: 'file', source: msg, mime: content.documentMessage.mimetype || 'application/octet-stream', name: content.documentMessage.fileName || 'file' };
+  if (content.stickerMessage) return { text: null, type: 'image', source: msg, mime: content.stickerMessage.mimetype || 'image/webp', name: 'sticker.webp' };
+  return { text, type: 'text', source: null, mime: null, name: null };
 }
 
 /**
@@ -187,6 +220,55 @@ async function resolvePhoneFromLid(sock, lidJid) {
     } catch { /* try next */ }
   }
   return null;
+}
+
+function recipientJid(raw) {
+  const value = String(raw || '').trim();
+  if (!value) return null;
+  if (value.endsWith('@s.whatsapp.net') || value.endsWith('@lid')) return value;
+  const digits = value.replace(/\D/g, '');
+  return digits.length >= 10 ? `${digits}@s.whatsapp.net` : null;
+}
+
+async function deliverOutbox(userId, sock) {
+  const result = await api('outbox', { user_id: userId });
+  for (const item of result.messages || []) {
+    const jid = recipientJid(item.wa_id);
+    if (!jid) {
+      await api('outbox_ack', { user_id: userId, id: item.id, error: 'গ্রাহকের WhatsApp নম্বর পাওয়া যায়নি' });
+      continue;
+    }
+
+    try {
+      let sent = null;
+      const attachments = Array.isArray(item.attachments) && item.attachments.length
+        ? item.attachments
+        : item.media_url ? [{ type: item.content_type, url: item.media_url, name: item.file_name }] : [];
+      if (!attachments.length) {
+        sent = await sock.sendMessage(jid, { text: String(item.text || '') });
+      } else {
+        for (let i = 0; i < attachments.length; i++) {
+          const attachment = attachments[i];
+          const media = { url: attachment.url };
+          const caption = i === 0 ? item.text || undefined : undefined;
+          if (attachment.type === 'image') sent = await sock.sendMessage(jid, { image: media, caption });
+          else if (attachment.type === 'video') sent = await sock.sendMessage(jid, { video: media, caption });
+          else if (attachment.type === 'audio') sent = await sock.sendMessage(jid, { audio: media, mimetype: attachment.mime || 'audio/ogg', ptt: false });
+          else sent = await sock.sendMessage(jid, { document: media, fileName: attachment.name || 'attachment', caption });
+        }
+      }
+      await api('outbox_ack', {
+        user_id: userId,
+        id: item.id,
+        message_id: sent?.key?.id || null,
+      });
+      console.log(`[bridge] delivered inbox reply ${item.id}`);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      await api('outbox_ack', { user_id: userId, id: item.id, error: message });
+      console.warn(`[bridge] reply ${item.id} failed:`, message);
+    }
+  }
 }
 
 
@@ -288,6 +370,21 @@ async function startSession(userId, storedCreds) {
   sock.ev.on('contacts.upsert', onContacts);
   sock.ev.on('contacts.update', onContacts);
 
+  sock.ev.on('messages.update', async (updates) => {
+    for (const update of updates || []) {
+      const messageId = update?.key?.id;
+      if (!messageId || !update?.key?.fromMe) continue;
+      const status = Number(update.update?.status || 0);
+      if (status >= Number(proto.WebMessageInfo.Status.DELIVERY_ACK || 3)) {
+        await api('message_status', {
+          user_id: userId,
+          message_id: messageId,
+          read: status >= Number(proto.WebMessageInfo.Status.READ || 4),
+        });
+      }
+    }
+  });
+
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify' && type !== 'append') return;
@@ -302,8 +399,19 @@ async function startSession(userId, storedCreds) {
           continue;
         }
         const { ctwa_clid, ad_id, source_type } = extractReferral(msg);
+        const content = messageContent(msg);
+        const messageId = String(msg.key?.id || '');
         if (sender.phone && sender.lid) rememberLidPhone(sender.lid, sender.phone);
         const phone = sender.phone || (await resolvePhoneFromLid(sock, sender.lid));
+        let mediaUrl = null;
+        if (content.source && messageId) {
+          try {
+            const uploaded = await uploadInboundMedia(userId, messageId, content);
+            mediaUrl = uploaded.url || null;
+          } catch (e) {
+            console.warn(`[bridge] media ${messageId} failed:`, e instanceof Error ? e.message : String(e));
+          }
+        }
 
         const result = await api('inbound', {
           user_id: userId,
@@ -314,6 +422,13 @@ async function startSession(userId, storedCreds) {
           ctwa_clid,
           ad_id,
           source_type,
+          text: content.text,
+          media_type: content.type,
+          media_url: mediaUrl,
+          file_name: content.name,
+          media_mime: content.mime,
+          message_id: messageId || null,
+          created_at: msg.messageTimestamp ? new Date(Number(msg.messageTimestamp) * 1000).toISOString() : null,
         });
         if (result.success) {
           console.log(`[bridge] inbound contact saved for ${userId} (phone: ${phone || 'unresolved'})`);
@@ -354,6 +469,9 @@ async function tick() {
         console.warn('[bridge] start failed:', message);
         api('set_status', { user_id: s.user_id, status: 'disconnected', error: `Bridge start failed: ${message}` });
       });
+    } else {
+      const entry = sessions.get(s.user_id);
+      if (entry?.sock?.user) await deliverOutbox(s.user_id, entry.sock);
     }
   }
 
@@ -365,4 +483,10 @@ async function tick() {
 
 console.log('[bridge] BillStock Pro WhatsApp bridge started');
 tick().catch((e) => console.warn('[bridge] tick error:', e.message));
-setInterval(() => { tick().catch((e) => console.warn('[bridge] tick error:', e.message)); }, POLL_INTERVAL);
+let ticking = false;
+setInterval(async () => {
+  if (ticking) return;
+  ticking = true;
+  try { await tick(); } catch (e) { console.warn('[bridge] tick error:', e.message); }
+  finally { ticking = false; }
+}, POLL_INTERVAL);

@@ -1,10 +1,8 @@
 # BillStock Pro — WhatsApp link-device bridge
 
 A tiny always-on worker that holds the WhatsApp Web "linked device" session for
-each shop. It generates the QR code the app shows, and reports each incoming
-contact (phone, name, ad-click reference) back to BillStock Pro.
-
-It never stores or forwards message text.
+each shop. It generates the QR code the app shows, reports incoming messages
+back to BillStock Pro, and sends replies queued from the unified Inbox.
 
 ## What you need
 
@@ -40,5 +38,5 @@ pm2 save && pm2 startup
 
 This uses WhatsApp's linked-device (companion) protocol, which is not an
 official WhatsApp API. It is the same mechanism the WooCommerce WhatsApp
-plugins use. Use a business number you can afford to re-link, and keep message
-sending out of it — this bridge only listens.
+plugins use. Use a business number you can afford to re-link and monitor the
+linked device regularly.

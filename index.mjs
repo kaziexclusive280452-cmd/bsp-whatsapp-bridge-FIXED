@@ -29,6 +29,15 @@ if (!BRIDGE_URL || !BRIDGE_TOKEN) {
 
 const logger = pino({ level: 'warn' });
 
+// Sent with every call so the app can tell which link-server build is live.
+const BRIDGE_VERSION = 'v4-baileys7';
+const INSTANCE = Math.random().toString(36).slice(2, 8);
+
+/** Forward important events to the app's logs (Railway logs are hard to reach). */
+function report(event, data = {}) {
+  api('log', { event, ...data }).catch(() => {});
+}
+
 /** userId -> { sock, saveTimer, closing } */
 const sessions = new Map();
 
@@ -45,10 +54,10 @@ async function api(action, payload = {}) {
   const res = await fetch(BRIDGE_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'x-bridge-token': BRIDGE_TOKEN },
-    body: JSON.stringify({ action, ...payload }),
+    body: JSON.stringify({ action, bridge_version: BRIDGE_VERSION, instance: INSTANCE, ...payload }),
   });
   const out = await res.json().catch(() => ({}));
-  if (!out.success) console.warn(`[bridge] ${action} failed:`, out.error || res.status);
+  if (!out.success && action !== 'log') console.warn(`[bridge] ${action} failed:`, out.error || res.status);
   return out;
 }
 
@@ -316,10 +325,12 @@ async function deliverOutbox(userId, sock) {
         message_id: sent?.key?.id || null,
       });
       console.log(`[bridge] delivered inbox reply ${item.id}`);
+      report('send_ok', { user_id: userId, jid, message_id: sent?.key?.id || null });
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
       await api('outbox_ack', { user_id: userId, id: item.id, error: message });
       console.warn(`[bridge] reply ${item.id} failed:`, message);
+      report('send_failed', { user_id: userId, jid, error: message });
     }
   }
 }
@@ -397,12 +408,15 @@ async function startSession(userId, storedCreds) {
         display_name: sock.user?.name || null,
       });
       console.log(`[bridge] ${userId} connected`);
+      report('connected', { user_id: userId, wa_version: version.join('.') });
     }
 
     if (connection === 'close') {
       const code = lastDisconnect?.error?.output?.statusCode;
       const loggedOut = code === DisconnectReason.loggedOut;
       sessions.delete(userId);
+      if (loggedOut) authStates.delete(userId);
+      else await persist().catch(() => {});
       await api('set_status', {
         user_id: userId,
         status: 'disconnected',
@@ -410,6 +424,7 @@ async function startSession(userId, storedCreds) {
         error: loggedOut ? 'Device unlinked from WhatsApp' : `WhatsApp socket closed (${code || 'unknown'}); retrying`,
       });
       console.log(`[bridge] ${userId} closed (code ${code || 'n/a'})`);
+      report('closed', { user_id: userId, code: code || null, error: lastDisconnect?.error?.message || null });
     }
   });
 
@@ -441,6 +456,7 @@ async function startSession(userId, storedCreds) {
       if (!messageId || !update?.key?.fromMe) continue;
       const status = Number(update.update?.status || 0);
       if (status >= Number(proto.WebMessageInfo.Status.DELIVERY_ACK || 3)) {
+        report('status', { user_id: userId, id: messageId, status });
         await api('message_status', {
           user_id: userId,
           message_id: messageId,
@@ -463,10 +479,12 @@ async function startSession(userId, storedCreds) {
         // under the same id — reporting the empty copy would hide the real one.
         if (!msg.message) {
           console.log(`[bridge] message ${msg.key?.id} not decrypted yet (stub ${msg.messageStubType || 'n/a'}); waiting for retry`);
+          report('undecrypted', { user_id: userId, id: msg.key?.id, jid: remoteJid, stub: msg.messageStubType || null, params: msg.messageStubParameters || null });
           continue;
         }
         if (isSystemOnly(unwrapContent(msg.message))) continue;
         rememberSent(msg);
+        report('inbound_decrypted', { user_id: userId, id: msg.key?.id, jid: remoteJid });
         const sender = extractSender(msg);
         if (!sender) {
           console.warn('[bridge] skipped inbound: no supported sender ID');
@@ -521,6 +539,7 @@ async function stopSession(userId) {
     try { await entry.sock.logout(); } catch { try { entry.sock.end(); } catch {} }
   }
   sessions.delete(userId);
+  authStates.delete(userId);
   await api('set_status', { user_id: userId, status: 'disconnected', clear_creds: true });
 }
 
@@ -555,7 +574,8 @@ async function tick() {
   }
 }
 
-console.log('[bridge] BillStock Pro WhatsApp bridge started');
+console.log(`[bridge] BillStock Pro WhatsApp bridge started (${BRIDGE_VERSION}, instance ${INSTANCE})`);
+report('boot', { node: process.version });
 tick().catch((e) => console.warn('[bridge] tick error:', e.message));
 let ticking = false;
 setInterval(async () => {

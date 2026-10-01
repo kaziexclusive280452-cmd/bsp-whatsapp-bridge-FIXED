@@ -32,6 +32,15 @@ const logger = pino({ level: 'warn' });
 /** userId -> { sock, saveTimer, closing } */
 const sessions = new Map();
 
+/** Recent message bodies (id -> proto.Message) for WhatsApp's decrypt-retry flow. */
+const recentMessages = new Map();
+function rememberSent(msg) {
+  const id = msg?.key?.id;
+  if (!id || !msg?.message) return;
+  recentMessages.set(id, msg.message);
+  if (recentMessages.size > 2000) recentMessages.delete(recentMessages.keys().next().value);
+}
+
 async function api(action, payload = {}) {
   const res = await fetch(BRIDGE_URL, {
     method: 'POST',
@@ -121,11 +130,41 @@ function extractReferral(msg) {
   };
 }
 
+/** Peel the wrapper layers WhatsApp puts around the real message. */
+function unwrapContent(message) {
+  let content = message || {};
+  for (let i = 0; i < 6; i++) {
+    const inner =
+      content.ephemeralMessage?.message ||
+      content.viewOnceMessage?.message ||
+      content.viewOnceMessageV2?.message ||
+      content.viewOnceMessageV2Extension?.message ||
+      content.documentWithCaptionMessage?.message ||
+      content.deviceSentMessage?.message ||
+      content.editedMessage?.message ||
+      null;
+    if (!inner) break;
+    content = inner;
+  }
+  return content;
+}
+
+/** True when the message has nothing a person wrote (keys, receipts, reactions…). */
+function isSystemOnly(content) {
+  const keys = Object.keys(content || {}).filter((k) => k !== 'messageContextInfo' && k !== 'senderKeyDistributionMessage');
+  if (keys.length === 0) return true;
+  return keys.every((k) => k === 'protocolMessage' || k === 'reactionMessage' || k === 'pollUpdateMessage' || k === 'keepInChatMessage');
+}
+
 function messageContent(msg) {
-  let content = msg?.message || {};
-  content = content.ephemeralMessage?.message || content.viewOnceMessageV2?.message || content.viewOnceMessage?.message || content;
+  const content = unwrapContent(msg?.message);
   const text = content.conversation || content.extendedTextMessage?.text ||
-    content.imageMessage?.caption || content.videoMessage?.caption || content.documentMessage?.caption || null;
+    content.imageMessage?.caption || content.videoMessage?.caption || content.documentMessage?.caption ||
+    content.buttonsResponseMessage?.selectedDisplayText || content.listResponseMessage?.title ||
+    content.templateButtonReplyMessage?.selectedDisplayText ||
+    (content.contactMessage ? `👤 ${content.contactMessage.displayName || 'Contact'}` : null) ||
+    (content.locationMessage ? `📍 https://maps.google.com/?q=${content.locationMessage.degreesLatitude},${content.locationMessage.degreesLongitude}` : null) ||
+    null;
   if (content.imageMessage) return { text, type: 'image', source: msg, mime: content.imageMessage.mimetype || 'image/jpeg', name: null };
   if (content.videoMessage) return { text, type: 'video', source: msg, mime: content.videoMessage.mimetype || 'video/mp4', name: null };
   if (content.audioMessage) return { text, type: 'audio', source: msg, mime: content.audioMessage.mimetype || 'audio/ogg', name: null };
@@ -257,6 +296,7 @@ async function deliverOutbox(userId, sock) {
           else sent = await sock.sendMessage(jid, { document: media, fileName: attachment.name || 'attachment', caption });
         }
       }
+      rememberSent(sent);
       await api('outbox_ack', {
         user_id: userId,
         id: item.id,
@@ -303,6 +343,10 @@ async function startSession(userId, storedCreds) {
     keepAliveIntervalMs: 20_000,
     connectTimeoutMs: 60_000,
     retryRequestDelayMs: 1_000,
+    maxMsgRetryCount: 5,
+    // Needed so WhatsApp can re-encrypt a message when the other phone asks
+    // for a retry; without it some messages never decrypt.
+    getMessage: async (key) => recentMessages.get(key?.id || '') || undefined,
   });
 
   sessions.set(userId, { sock });
@@ -393,6 +437,15 @@ async function startSession(userId, storedCreds) {
         if (msg.key?.fromMe) continue;
         const remoteJid = msg.key?.remoteJid || '';
         if (remoteJid.endsWith('@g.us') || remoteJid === 'status@broadcast') continue;
+        // Not decrypted yet ("Waiting for this message"). WhatsApp re-sends it
+        // after the key retry and Baileys emits it again with the real content
+        // under the same id — reporting the empty copy would hide the real one.
+        if (!msg.message) {
+          console.log(`[bridge] message ${msg.key?.id} not decrypted yet (stub ${msg.messageStubType || 'n/a'}); waiting for retry`);
+          continue;
+        }
+        if (isSystemOnly(unwrapContent(msg.message))) continue;
+        rememberSent(msg);
         const sender = extractSender(msg);
         if (!sender) {
           console.warn('[bridge] skipped inbound: no supported sender ID');

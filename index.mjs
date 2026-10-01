@@ -80,11 +80,24 @@ function makeRemoteAuthState(userId, stored) {
     keys: parsed?.keys || {},
   };
 
-  const persist = async () => {
-    await api('save_creds', {
-      user_id: userId,
-      creds: JSON.parse(JSON.stringify({ creds: state.creds, keys: state.keys }, BufferJSON.replacer)),
-    });
+  // One save at a time, always the newest snapshot. Parallel saves could land
+  // out of order and leave an older key set in the database; reloading that
+  // after a reconnect breaks encryption ("Waiting for this message").
+  let saving = null;
+  let dirty = false;
+  const persist = () => {
+    dirty = true;
+    if (saving) return saving;
+    saving = (async () => {
+      while (dirty) {
+        dirty = false;
+        await api('save_creds', {
+          user_id: userId,
+          creds: JSON.parse(JSON.stringify({ creds: state.creds, keys: state.keys }, BufferJSON.replacer)),
+        });
+      }
+    })().finally(() => { saving = null; });
+    return saving;
   };
 
   const keyStore = {
@@ -313,11 +326,19 @@ async function deliverOutbox(userId, sock) {
 
 
 
+/** userId -> live auth state, reused across reconnects so keys never roll back. */
+const authStates = new Map();
+
 async function startSession(userId, storedCreds) {
   if (sessions.has(userId)) return;
   sessions.set(userId, { starting: true });
 
-  const { state, persist } = makeRemoteAuthState(userId, storedCreds);
+  let auth = authStates.get(userId);
+  if (!auth) {
+    auth = makeRemoteAuthState(userId, storedCreds);
+    authStates.set(userId, auth);
+  }
+  const { state, persist } = auth;
 
   // WhatsApp rejects stale web-client versions with an immediate socket close
   // and never emits a QR. Resolve the current supported version at session
